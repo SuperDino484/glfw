@@ -1,7 +1,6 @@
 project "glfw"
     kind "StaticLib"
     language "C"
-	staticruntime "on"
 
     targetdir("../bin/" .. outputdir .. "/%{prj.name}")
     objdir("../bin-int/" .. outputdir .. "/%{prj.name}")
@@ -20,7 +19,7 @@ project "glfw"
 		"src/window.c",
 		"src/null_init.c",
 		"src/null_monitor.c",
-    	"src/null_window.c",
+    		"src/null_window.c",
 		"src/null_joystick.c",
 	}
 
@@ -46,9 +45,13 @@ project "glfw"
 		}
 
 	filter {"system:windows", "configurations:Debug"}
-        buildoptions "/MTd"
-		runtime "Debug"
+        	staticruntime "on"
+		symbols "on"
 
 	filter {"system:windows", "configurations:Release"}
-        buildoptions "/MT"
-		runtime "Release"
+        	staticruntime "on"
+		optimize "on"
+
+	filter {"system:windows", "configurations:Distribution"}
+        	staticruntime "on"
+		optimize "on"
