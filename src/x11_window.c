@@ -32,7 +32,7 @@
 #include <X11/cursorfont.h>
 #include <X11/Xmd.h>
 
-#include <sys/select.h>
+#include <poll.h>
 
 #include <string.h>
 #include <stdio.h>
@@ -56,50 +56,79 @@
 
 #define _GLFW_XDND_VERSION 5
 
-
-// Wait for data to arrive using select
+// Wait for event data to arrive on the X11 display socket
 // This avoids blocking other threads via the per-display Xlib lock that also
 // covers GLX functions
 //
-static GLFWbool waitForEvent(double* timeout)
+static GLFWbool waitForX11Event(double* timeout)
 {
-    fd_set fds;
-    const int fd = ConnectionNumber(_glfw.x11.display);
-    int count = fd + 1;
+    struct pollfd fd = { ConnectionNumber(_glfw.x11.display), POLLIN };
+
+    while (!XPending(_glfw.x11.display))
+    {
+        if (!_glfwPollPOSIX(&fd, 1, timeout))
+            return GLFW_FALSE;
+    }
+
+    return GLFW_TRUE;
+}
+
+// Wait for event data to arrive on any event file descriptor
+// This avoids blocking other threads via the per-display Xlib lock that also
+// covers GLX functions
+//
+static GLFWbool waitForAnyEvent(double* timeout)
+{
+    nfds_t count = 2;
+    struct pollfd fds[3] =
+    {
+        { ConnectionNumber(_glfw.x11.display), POLLIN },
+        { _glfw.x11.emptyEventPipe[0], POLLIN }
+    };
 
 #if defined(__linux__)
-    if (_glfw.linjs.inotify > fd)
-        count = _glfw.linjs.inotify + 1;
+    if (_glfw.joysticksInitialized)
+        fds[count++] = (struct pollfd) { _glfw.linjs.inotify, POLLIN };
 #endif
+
+    while (!XPending(_glfw.x11.display))
+    {
+        if (!_glfwPollPOSIX(fds, count, timeout))
+            return GLFW_FALSE;
+
+        for (int i = 1; i < count; i++)
+        {
+            if (fds[i].revents & POLLIN)
+                return GLFW_TRUE;
+        }
+    }
+
+    return GLFW_TRUE;
+}
+
+// Writes a byte to the empty event pipe
+//
+static void writeEmptyEvent(void)
+{
     for (;;)
     {
-        FD_ZERO(&fds);
-        FD_SET(fd, &fds);
-#if defined(__linux__)
-        if (_glfw.linjs.inotify > 0)
-            FD_SET(_glfw.linjs.inotify, &fds);
-#endif
+        const char byte = 0;
+        const ssize_t result = write(_glfw.x11.emptyEventPipe[1], &byte, 1);
+        if (result == 1 || (result == -1 && errno != EINTR))
+            break;
+    }
+}
 
-        if (timeout)
-        {
-            const long seconds = (long) *timeout;
-            const long microseconds = (long) ((*timeout - seconds) * 1e6);
-            struct timeval tv = { seconds, microseconds };
-            const uint64_t base = _glfwPlatformGetTimerValue();
-
-            const int result = select(count, &fds, NULL, NULL, &tv);
-            const int error = errno;
-
-            *timeout -= (_glfwPlatformGetTimerValue() - base) /
-                (double) _glfwPlatformGetTimerFrequency();
-
-            if (result > 0)
-                return GLFW_TRUE;
-            if ((result == -1 && error == EINTR) || *timeout <= 0.0)
-                return GLFW_FALSE;
-        }
-        else if (select(count, &fds, NULL, NULL, NULL) != -1 || errno != EINTR)
-            return GLFW_TRUE;
+// Drains available data from the empty event pipe
+//
+static void drainEmptyEvents(void)
+{
+    for (;;)
+    {
+        char dummy[64];
+        const ssize_t result = read(_glfw.x11.emptyEventPipe[0], dummy, sizeof(dummy));
+        if (result == -1 && errno != EINTR)
+            break;
     }
 }
 
@@ -116,7 +145,7 @@ static GLFWbool waitForVisibilityNotify(_GLFWwindow* window)
                                    VisibilityNotify,
                                    &dummy))
     {
-        if (!waitForEvent(&timeout))
+        if (!waitForX11Event(&timeout))
             return GLFW_FALSE;
     }
 
@@ -378,95 +407,13 @@ static void updateWindowMode(_GLFWwindow* window)
     }
 }
 
-// Splits and translates a text/uri-list into separate file paths
-// NOTE: This function destroys the provided string
-//
-static char** parseUriList(char* text, int* count)
-{
-    const char* prefix = "file://";
-    char** paths = NULL;
-    char* line;
-
-    *count = 0;
-
-    while ((line = strtok(text, "\r\n")))
-    {
-        text = NULL;
-
-        if (line[0] == '#')
-            continue;
-
-        if (strncmp(line, prefix, strlen(prefix)) == 0)
-        {
-            line += strlen(prefix);
-            // TODO: Validate hostname
-            while (*line != '/')
-                line++;
-        }
-
-        (*count)++;
-
-        char* path = _glfw_calloc(strlen(line) + 1, 1);
-        paths = _glfw_realloc(paths, *count * sizeof(char*));
-        paths[*count - 1] = path;
-
-        while (*line)
-        {
-            if (line[0] == '%' && line[1] && line[2])
-            {
-                const char digits[3] = { line[1], line[2], '\0' };
-                *path = strtol(digits, NULL, 16);
-                line += 2;
-            }
-            else
-                *path = *line;
-
-            path++;
-            line++;
-        }
-    }
-
-    return paths;
-}
-
-// Encode a Unicode code point to a UTF-8 stream
-// Based on cutef8 by Jeff Bezanson (Public Domain)
-//
-static size_t encodeUTF8(char* s, unsigned int ch)
-{
-    size_t count = 0;
-
-    if (ch < 0x80)
-        s[count++] = (char) ch;
-    else if (ch < 0x800)
-    {
-        s[count++] = (ch >> 6) | 0xc0;
-        s[count++] = (ch & 0x3f) | 0x80;
-    }
-    else if (ch < 0x10000)
-    {
-        s[count++] = (ch >> 12) | 0xe0;
-        s[count++] = ((ch >> 6) & 0x3f) | 0x80;
-        s[count++] = (ch & 0x3f) | 0x80;
-    }
-    else if (ch < 0x110000)
-    {
-        s[count++] = (ch >> 18) | 0xf0;
-        s[count++] = ((ch >> 12) & 0x3f) | 0x80;
-        s[count++] = ((ch >> 6) & 0x3f) | 0x80;
-        s[count++] = (ch & 0x3f) | 0x80;
-    }
-
-    return count;
-}
-
 // Decode a Unicode code point from a UTF-8 stream
 // Based on cutef8 by Jeff Bezanson (Public Domain)
 //
-static unsigned int decodeUTF8(const char** s)
+static uint32_t decodeUTF8(const char** s)
 {
-    unsigned int ch = 0, count = 0;
-    static const unsigned int offsets[] =
+    uint32_t codepoint = 0, count = 0;
+    static const uint32_t offsets[] =
     {
         0x00000000u, 0x00003080u, 0x000e2080u,
         0x03c82080u, 0xfa082080u, 0x82082080u
@@ -474,13 +421,13 @@ static unsigned int decodeUTF8(const char** s)
 
     do
     {
-        ch = (ch << 6) + (unsigned char) **s;
+        codepoint = (codepoint << 6) + (unsigned char) **s;
         (*s)++;
         count++;
     } while ((**s & 0xc0) == 0x80);
 
     assert(count <= 6);
-    return ch - offsets[count - 1];
+    return codepoint - offsets[count - 1];
 }
 
 // Convert the specified Latin-1 string to UTF-8
@@ -497,7 +444,7 @@ static char* convertLatin1toUTF8(const char* source)
     char* tp = target;
 
     for (sp = source;  *sp;  sp++)
-        tp += encodeUTF8(tp, *sp);
+        tp += _glfwEncodeUTF8(tp, *sp);
 
     return target;
 }
@@ -918,20 +865,6 @@ static Atom writeTargetToProperty(const XSelectionRequestEvent* request)
     return None;
 }
 
-static void handleSelectionClear(XEvent* event)
-{
-    if (event->xselectionclear.selection == _glfw.x11.PRIMARY)
-    {
-        _glfw_free(_glfw.x11.primarySelectionString);
-        _glfw.x11.primarySelectionString = NULL;
-    }
-    else
-    {
-        _glfw_free(_glfw.x11.clipboardString);
-        _glfw.x11.clipboardString = NULL;
-    }
-}
-
 static void handleSelectionRequest(XEvent* event)
 {
     const XSelectionRequestEvent* request = &event->xselectionrequest;
@@ -989,7 +922,7 @@ static const char* getSelectionString(Atom selection)
                                        SelectionNotify,
                                        &notification))
         {
-            waitForEvent(NULL);
+            waitForX11Event(NULL);
         }
 
         if (notification.xselection.property == None)
@@ -1025,7 +958,7 @@ static const char* getSelectionString(Atom selection)
                                       isSelPropNewValueNotify,
                                       (XPointer) &notification))
                 {
-                    waitForEvent(NULL);
+                    waitForX11Event(NULL);
                 }
 
                 XFree(data);
@@ -1052,13 +985,16 @@ static const char* getSelectionString(Atom selection)
 
                 if (!itemCount)
                 {
-                    if (targets[i] == XA_STRING)
+                    if (string)
                     {
-                        *selectionString = convertLatin1toUTF8(string);
-                        _glfw_free(string);
+                        if (targets[i] == XA_STRING)
+                        {
+                            *selectionString = convertLatin1toUTF8(string);
+                            _glfw_free(string);
+                        }
+                        else
+                            *selectionString = string;
                     }
-                    else
-                        *selectionString = string;
 
                     break;
                 }
@@ -1224,12 +1160,7 @@ static void processEvent(XEvent *event)
         return;
     }
 
-    if (event->type == SelectionClear)
-    {
-        handleSelectionClear(event);
-        return;
-    }
-    else if (event->type == SelectionRequest)
+    if (event->type == SelectionRequest)
     {
         handleSelectionRequest(event);
         return;
@@ -1269,7 +1200,7 @@ static void processEvent(XEvent *event)
                 //       (the server never sends a timestamp of zero)
                 // NOTE: Timestamp difference is compared to handle wrap-around
                 Time diff = event->xkey.time - window->x11.keyPressTimes[keycode];
-                if (diff == event->xkey.time || (diff > 0 && diff < (1 << 31)))
+                if (diff == event->xkey.time || (diff > 0 && diff < ((Time)1 << 31)))
                 {
                     if (keycode)
                         _glfwInputKey(window, key, keycode, GLFW_PRESS, mods);
@@ -1317,9 +1248,9 @@ static void processEvent(XEvent *event)
 
                 _glfwInputKey(window, key, keycode, GLFW_PRESS, mods);
 
-                const long character = _glfwKeySym2Unicode(keysym);
-                if (character != -1)
-                    _glfwInputChar(window, character, mods, plain);
+                const uint32_t codepoint = _glfwKeySym2Unicode(keysym);
+                if (codepoint != GLFW_INVALID_CODEPOINT)
+                    _glfwInputChar(window, codepoint, mods, plain);
             }
 
             return;
@@ -1717,7 +1648,7 @@ static void processEvent(XEvent *event)
                 if (result)
                 {
                     int count;
-                    char** paths = parseUriList(data, &count);
+                    char** paths = _glfwParseUriList(data, &count);
 
                     _glfwInputDrop(window, count, (const char**) paths);
 
@@ -1906,10 +1837,6 @@ void _glfwPushSelectionToManagerX11(void)
                     handleSelectionRequest(&event);
                     break;
 
-                case SelectionClear:
-                    handleSelectionClear(&event);
-                    break;
-
                 case SelectionNotify:
                 {
                     if (event.xselection.target == _glfw.x11.SAVE_TARGETS)
@@ -1927,7 +1854,7 @@ void _glfwPushSelectionToManagerX11(void)
             }
         }
 
-        waitForEvent(NULL);
+        waitForX11Event(NULL);
     }
 }
 
@@ -1968,10 +1895,10 @@ void _glfwCreateInputContextX11(_GLFWwindow* window)
 //////                       GLFW platform API                      //////
 //////////////////////////////////////////////////////////////////////////
 
-int _glfwCreateWindowX11(_GLFWwindow* window,
-                         const _GLFWwndconfig* wndconfig,
-                         const _GLFWctxconfig* ctxconfig,
-                         const _GLFWfbconfig* fbconfig)
+GLFWbool _glfwCreateWindowX11(_GLFWwindow* window,
+                              const _GLFWwndconfig* wndconfig,
+                              const _GLFWctxconfig* ctxconfig,
+                              const _GLFWfbconfig* fbconfig)
 {
     Visual* visual = NULL;
     int depth;
@@ -2025,13 +1952,31 @@ int _glfwCreateWindowX11(_GLFWwindow* window,
             if (!_glfwCreateContextOSMesa(window, ctxconfig, fbconfig))
                 return GLFW_FALSE;
         }
+
+        if (!_glfwRefreshContextAttribs(window, ctxconfig))
+            return GLFW_FALSE;
     }
+
+    if (wndconfig->mousePassthrough)
+        _glfwSetWindowMousePassthroughX11(window, GLFW_TRUE);
 
     if (window->monitor)
     {
         _glfwShowWindowX11(window);
         updateWindowMode(window);
         acquireMonitor(window);
+
+        if (wndconfig->centerCursor)
+            _glfwCenterCursorInContentArea(window);
+    }
+    else
+    {
+        if (wndconfig->visible)
+        {
+            _glfwShowWindowX11(window);
+            if (wndconfig->focused)
+                _glfwFocusWindowX11(window);
+        }
     }
 
     XFlush(_glfw.x11.display);
@@ -2269,7 +2214,7 @@ void _glfwGetWindowFrameSizeX11(_GLFWwindow* window,
                               isFrameExtentsEvent,
                               (XPointer) window))
         {
-            if (!waitForEvent(&timeout))
+            if (!waitForX11Event(&timeout))
             {
                 _glfwInputError(GLFW_PLATFORM_ERROR,
                                 "X11: The window manager has a broken _NET_REQUEST_FRAME_EXTENTS implementation; please report this issue");
@@ -2517,7 +2462,7 @@ void _glfwSetWindowMonitorX11(_GLFWwindow* window,
     XFlush(_glfw.x11.display);
 }
 
-int _glfwWindowFocusedX11(_GLFWwindow* window)
+GLFWbool _glfwWindowFocusedX11(_GLFWwindow* window)
 {
     Window focused;
     int state;
@@ -2526,19 +2471,19 @@ int _glfwWindowFocusedX11(_GLFWwindow* window)
     return window->x11.handle == focused;
 }
 
-int _glfwWindowIconifiedX11(_GLFWwindow* window)
+GLFWbool _glfwWindowIconifiedX11(_GLFWwindow* window)
 {
     return getWindowState(window) == IconicState;
 }
 
-int _glfwWindowVisibleX11(_GLFWwindow* window)
+GLFWbool _glfwWindowVisibleX11(_GLFWwindow* window)
 {
     XWindowAttributes wa;
     XGetWindowAttributes(_glfw.x11.display, window->x11.handle, &wa);
     return wa.map_state == IsViewable;
 }
 
-int _glfwWindowMaximizedX11(_GLFWwindow* window)
+GLFWbool _glfwWindowMaximizedX11(_GLFWwindow* window)
 {
     Atom* states;
     GLFWbool maximized = GLFW_FALSE;
@@ -2572,7 +2517,7 @@ int _glfwWindowMaximizedX11(_GLFWwindow* window)
     return maximized;
 }
 
-int _glfwWindowHoveredX11(_GLFWwindow* window)
+GLFWbool _glfwWindowHoveredX11(_GLFWwindow* window)
 {
     Window w = _glfw.x11.root;
     while (w)
@@ -2600,7 +2545,7 @@ int _glfwWindowHoveredX11(_GLFWwindow* window)
     return GLFW_FALSE;
 }
 
-int _glfwFramebufferTransparentX11(_GLFWwindow* window)
+GLFWbool _glfwFramebufferTransparentX11(_GLFWwindow* window)
 {
     if (!window->x11.transparent)
         return GLFW_FALSE;
@@ -2775,7 +2720,7 @@ GLFWbool _glfwRawMouseMotionSupportedX11(void)
 
 void _glfwPollEventsX11(void)
 {
-    _GLFWwindow* window;
+    drainEmptyEvents();
 
 #if defined(__linux__)
     if (_glfw.joysticksInitialized)
@@ -2790,7 +2735,7 @@ void _glfwPollEventsX11(void)
         processEvent(&event);
     }
 
-    window = _glfw.x11.disabledCursorWindow;
+    _GLFWwindow* window = _glfw.x11.disabledCursorWindow;
     if (window)
     {
         int width, height;
@@ -2810,32 +2755,19 @@ void _glfwPollEventsX11(void)
 
 void _glfwWaitEventsX11(void)
 {
-    while (!XPending(_glfw.x11.display))
-        waitForEvent(NULL);
-
+    waitForAnyEvent(NULL);
     _glfwPollEventsX11();
 }
 
 void _glfwWaitEventsTimeoutX11(double timeout)
 {
-    while (!XPending(_glfw.x11.display))
-    {
-        if (!waitForEvent(&timeout))
-            break;
-    }
-
+    waitForAnyEvent(&timeout);
     _glfwPollEventsX11();
 }
 
 void _glfwPostEmptyEventX11(void)
 {
-    XEvent event = { ClientMessage };
-    event.xclient.window = _glfw.x11.helperWindowHandle;
-    event.xclient.format = 32; // Data is 32-bit longs
-    event.xclient.message_type = _glfw.x11.NULL_;
-
-    XSendEvent(_glfw.x11.display, _glfw.x11.helperWindowHandle, False, 0, &event);
-    XFlush(_glfw.x11.display);
+    writeEmptyEvent();
 }
 
 void _glfwGetCursorPosX11(_GLFWwindow* window, double* xpos, double* ypos)
@@ -2899,11 +2831,11 @@ const char* _glfwGetScancodeNameX11(int scancode)
     if (keysym == NoSymbol)
         return NULL;
 
-    const long ch = _glfwKeySym2Unicode(keysym);
-    if (ch == -1)
+    const uint32_t codepoint = _glfwKeySym2Unicode(keysym);
+    if (codepoint == GLFW_INVALID_CODEPOINT)
         return NULL;
 
-    const size_t count = encodeUTF8(_glfw.x11.keynames[key], (unsigned int) ch);
+    const size_t count = _glfwEncodeUTF8(_glfw.x11.keynames[key], codepoint);
     if (count == 0)
         return NULL;
 
@@ -2916,9 +2848,9 @@ int _glfwGetKeyScancodeX11(int key)
     return _glfw.x11.scancodes[key];
 }
 
-int _glfwCreateCursorX11(_GLFWcursor* cursor,
-                         const GLFWimage* image,
-                         int xhot, int yhot)
+GLFWbool _glfwCreateCursorX11(_GLFWcursor* cursor,
+                              const GLFWimage* image,
+                              int xhot, int yhot)
 {
     cursor->x11.handle = _glfwCreateNativeCursorX11(image, xhot, yhot);
     if (!cursor->x11.handle)
@@ -2927,7 +2859,7 @@ int _glfwCreateCursorX11(_GLFWcursor* cursor,
     return GLFW_TRUE;
 }
 
-int _glfwCreateStandardCursorX11(_GLFWcursor* cursor, int shape)
+GLFWbool _glfwCreateStandardCursorX11(_GLFWcursor* cursor, int shape)
 {
     if (_glfw.x11.xcursor.handle)
     {
@@ -3134,9 +3066,9 @@ void _glfwGetRequiredInstanceExtensionsX11(char** extensions)
         extensions[1] = "VK_KHR_xlib_surface";
 }
 
-int _glfwGetPhysicalDevicePresentationSupportX11(VkInstance instance,
-                                                 VkPhysicalDevice device,
-                                                 uint32_t queuefamily)
+GLFWbool _glfwGetPhysicalDevicePresentationSupportX11(VkInstance instance,
+                                                      VkPhysicalDevice device,
+                                                      uint32_t queuefamily)
 {
     VisualID visualID = XVisualIDFromVisual(DefaultVisual(_glfw.x11.display,
                                                           _glfw.x11.screen));
