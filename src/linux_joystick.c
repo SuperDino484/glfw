@@ -29,6 +29,8 @@
 
 #include "internal.h"
 
+#if defined(GLFW_BUILD_LINUX_JOYSTICK)
+
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/inotify.h>
@@ -157,7 +159,7 @@ static GLFWbool openJoystickDevice(const char* path)
     }
 
     // Ensure this device supports the events expected of a joystick
-    if (!isBitSet(EV_KEY, evBits) || !isBitSet(EV_ABS, evBits))
+    if (!isBitSet(EV_ABS, evBits))
     {
         close(linjs.fd);
         return GLFW_FALSE;
@@ -428,4 +430,6 @@ const char* _glfwGetMappingNameLinux(void)
 void _glfwUpdateGamepadGUIDLinux(char* guid)
 {
 }
+
+#endif // GLFW_BUILD_LINUX_JOYSTICK
 
